@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import time
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -17,9 +18,13 @@ from app.agent.prompts import (
     WRITER_SYSTEM,
     format_evidence,
     format_findings,
+    merge_findings_evidence,
 )
+from app import budget
 from app.agent.state import AgentState
 from app.agent.tracing import traced
+from app.budget import BudgetExceeded
+from app.config import settings
 from app.events import BranchEnd, BranchStart, Evaluation, Progress, Token, emit
 from app.llm import ainvoke_tracked, astream_tracked
 from app.retrieval import index_exists, search_docs, search_web, web_search_enabled
@@ -31,6 +36,16 @@ from app.retrieval import index_exists, search_docs, search_web, web_search_enab
 @traced("researcher")
 async def researcher(state: AgentState) -> dict:
     item_id, query = state["item_id"], state["query"]
+    count = state.get("research_count", 0) + 1
+
+    # 재검색 : 문서는 같은 결과라 다시 찾지 않고, 웹을 뉴스로 찾아 기존 근거에 이어 붙입니다.
+    if count > 1:
+        web = await search_web(f"{state['item_name']} {query}", max_results=3, topic="news")
+        seen = {e["source"] for e in state.get("evidence", [])}
+        web = [e for e in web if e["source"] not in seen]      # 1차 검색과 같은 기사는 번호가 둘로 나뉘지 않게 제외
+        dated = sum(1 for e in web if e.get("date"))
+        emit(Progress(node="researcher", message=f"뉴스 재검색 {len(web)}건 (날짜 있는 근거 {dated}건)"))
+        return {"evidence": state.get("evidence", []) + web, "research_count": count}
 
     if not index_exists(item_id):
         emit(Progress(node="researcher", message=f"'{item_id}' 문서 인덱스가 없습니다. scripts/ingest.py 를 먼저 실행하세요."))
@@ -44,7 +59,7 @@ async def researcher(state: AgentState) -> dict:
     else:
         emit(Progress(node="researcher", message="TAVILY_API_KEY 가 없어 웹 검색을 건너뜁니다."))
 
-    return {"evidence": docs + web}
+    return {"evidence": docs + web, "research_count": count}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -73,26 +88,32 @@ async def analyze_competitor(state: AgentState, competitor: str) -> dict:
         "competitor": competitor,
         "analysis": analysis,
         "sources": [e["source"] for e in evidence],
+        "evidence": evidence,      # writer 가 분석 속 [n] 번호를 같은 자료로 이어 받기 위해 보관
     }
 
 
 @traced("competitor_analyst")
 async def competitor_analyst(state: AgentState) -> dict:
-    competitors = state.get("competitors", [])
-    emit(Progress(node="competitor_analyst", message=f"분석 대상 {len(competitors)}개 기업: {', '.join(competitors)}"))
+    """
+    갈래 하나 = 기업 하나. Supervisor 가 Send 로 기업 수만큼 동시에 실행합니다.
+    시간 제한을 넘기거나 실패한 갈래는 error 를 기록하고, 나머지 갈래는 그대로 진행합니다.
+    """
+    competitor = state["competitor"]
+    emit(BranchStart(node="competitor_analyst", branch=competitor))
+    started = time.perf_counter()
 
-    update: dict = {}
-    for competitor in competitors:
-        emit(BranchStart(node="competitor_analyst", branch=competitor))
-        started = time.perf_counter()
+    try:
+        finding = await asyncio.wait_for(analyze_competitor(state, competitor), timeout=settings.branch_timeout_sec)
+    except asyncio.TimeoutError:
+        finding = {"competitor": competitor, "error": f"시간 제한 {settings.branch_timeout_sec:g}초 초과"}
+    except Exception as e:      # 한 갈래의 실패가 실행 전체를 멈추지 않도록 기록만 남깁니다.
+        finding = {"competitor": competitor, "error": f"{type(e).__name__}: {e}"}
 
-        finding = await analyze_competitor(state, competitor)
-        update["competitor_findings"] = [finding]      # 기업별 분석 결과 저장
-
-        elapsed = int((time.perf_counter() - started) * 1000)
-        emit(BranchEnd(node="competitor_analyst", branch=competitor, duration_ms=elapsed))
-
-    return update
+    elapsed = int((time.perf_counter() - started) * 1000)
+    if finding.get("error"):
+        emit(Progress(node="competitor_analyst", message=f"{competitor} 분석 실패 — {finding['error']} (나머지 기업은 계속 진행)"))
+    emit(BranchEnd(node="competitor_analyst", branch=competitor, duration_ms=elapsed))
+    return {"competitor_findings": [finding]}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -118,18 +139,41 @@ async def writer(state: AgentState) -> dict:
         emit(Token(node="writer", text=POOR_OUTPUT_SAMPLE))
         return {"draft": POOR_OUTPUT_SAMPLE}
 
+    evidence, findings = merge_findings_evidence(state.get("evidence", []), state.get("competitor_findings", []))
     messages = [
         SystemMessage(content=WRITER_SYSTEM),
         HumanMessage(content=(
             f"사용자 질문: {state['query']}\n"
             f"분석 아이템: {state['item_name']}\n"
             f"분석 대상 기업: {', '.join(state.get('competitors', []))}\n\n"
-            f"근거 자료:\n{format_evidence(state.get('evidence', []))}\n\n"
-            f"경쟁사 분석 결과:\n{format_findings(state.get('competitor_findings', []))}"
+            f"근거 자료:\n{format_evidence(evidence)}\n\n"
+            f"경쟁사 분석 결과:\n{format_findings(findings)}"
         )),
     ]
-    draft = await astream_tracked(messages, node="writer")
+    try:
+        draft = await astream_tracked(messages, node="writer")
+    except BudgetExceeded as e:
+        emit(Progress(node="writer", message=f"{e} — 모은 근거와 분석으로 정리본을 냅니다."))
+        draft = budget_fallback_report(state["query"], evidence, findings)
+        emit(Token(node="writer", text=draft))
     return {"draft": draft}
+
+
+def budget_fallback_report(query: str, evidence: list[dict], findings: list[dict]) -> str:
+    """비용 상한 도달 시 LLM 없이 지금까지 모은 분석과 근거 목록을 그대로 정리합니다."""
+    lines = [
+        "> ⚠️ 실행 1회의 LLM 비용 상한에 도달해, LLM 작성 없이 지금까지 모은 결과로 정리한 보고서입니다.",
+        f"\n**질문** : {query}",
+        "\n## 경쟁사 분석 결과",
+        # format_findings 는 LLM용 지시문이 섞여 있어 사용자용 문구로 따로 정리합니다.
+        "\n\n".join(
+            f"### {f['competitor']}\n" + (f"(분석 실패: {f['error']})" if f.get("error") else f["analysis"])
+            for f in findings
+        ) or "(경쟁사 분석 결과 없음)",
+        "\n## 근거 자료",
+        *(f"- [{i}] ({e['kind']}) {e['title']} | {e['source']}" for i, e in enumerate(evidence, start=1)),
+    ]
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -152,4 +196,8 @@ async def step_evaluator(state: AgentState) -> dict:
 
 
 def route_after_evaluation(state: AgentState) -> str:
+    # 비용 상한 도달 후에는 다시 써도 LLM을 부를 수 없으므로 재작성하지 않고 종료합니다.
+    if not state.get("eval_passed") and budget.exceeded():
+        emit(Progress(node="step_evaluator", message="비용 상한 도달로 재작성 없이 종료합니다."))
+        return "end"
     return "end" if state.get("eval_passed") else "writer"

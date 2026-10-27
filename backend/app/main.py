@@ -21,6 +21,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel
 
+from app import budget
 from app.agent.graph import graph
 from app.config import get_item, load_items, settings
 from app.events import Done, ErrorEvent, Report, RunStart
@@ -80,6 +81,7 @@ async def chat(req: ChatRequest):
 
     async def event_stream():
         started = time.perf_counter()
+        budget.start(settings.cost_limit_usd)     # 이 실행 전용 비용 추적기
         totals = {"llm_calls": 0, "input_tokens": 0, "output_tokens": 0, "total_cost_usd": 0.0}
         final_draft = ""
 
