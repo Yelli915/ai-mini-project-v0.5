@@ -25,6 +25,11 @@ class Settings:
     tavily_api_key: str = os.getenv("TAVILY_API_KEY", "")
     recursion_limit: int = int(os.getenv("RECURSION_LIMIT", "25"))
     frontend_origin: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+    # 경쟁사 갈래 1곳의 시간 제한(초). 갈래 측정 2.98~4.26초의 2배 이상이고, 개선 전 순차 실행 전체(9.7~11초)를 넘지 않는 값
+    branch_timeout_sec: float = float(os.getenv("BRANCH_TIMEOUT_SEC", "10"))
+    # 실행 1회의 LLM 비용 상한(USD). 0 이하이면 상한 없음.
+    # DAY 1 최댓값 Q2 $0.00197의 약 1.8배 — 정상 실행(개선 후 Q2 $0.00204~0.00213)은 막지 않고, Q2 기준 writer 재시도 2회 후 상한에 도달해 3회째 재작성부터 막는 값 (writer만 부르는 Q1·Q3는 재시도 3~4회 후)
+    cost_limit_usd: float = float(os.getenv("COST_LIMIT_USD", "0.0035"))
     poor_output_test: bool = os.getenv("POOR_OUTPUT_TEST", "0") == "1"   # 화면에서 모드를 보내지 않을 때의 기본값
 
     data_dir: Path = BASE_DIR / "data"

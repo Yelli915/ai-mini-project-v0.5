@@ -55,20 +55,24 @@ def web_search_enabled() -> bool:
     return bool(settings.tavily_api_key)
 
 
-async def search_web(query: str, max_results: int = 3) -> list[Evidence]:
-    """웹에서 최신 정보를 찾습니다. (Tavily 클라이언트는 동기 방식이라 별도 스레드에서 실행)"""
+async def search_web(query: str, max_results: int = 3, topic: str = "general") -> list[Evidence]:
+    """
+    웹에서 최신 정보를 찾습니다. (Tavily 클라이언트는 동기 방식이라 별도 스레드에서 실행)
+    topic="news" 이면 뉴스 기사만 찾고, 결과에 발행일(date)이 들어 있습니다.
+    """
     if not web_search_enabled():
         return []
     from tavily import TavilyClient
 
     client = TavilyClient(api_key=settings.tavily_api_key)
-    result = await asyncio.to_thread(client.search, query=query, max_results=max_results)
+    result = await asyncio.to_thread(client.search, query=query, max_results=max_results, topic=topic)
     return [
         {
             "kind": "web",
             "source": r.get("url", ""),
             "title": r.get("title", ""),
             "content": r.get("content", ""),
+            "date": r.get("published_date"),
         }
         for r in result.get("results", [])
     ]
